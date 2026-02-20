@@ -15,9 +15,7 @@ export const runtime     = 'nodejs';
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
 import { z } from 'zod';
-
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const pdfParse = require('pdf-parse');
+import { parsePdf } from '@/lib/pdf-parser';
 
 // ---------------------------------------------------------------------------
 // Exported types
@@ -188,12 +186,12 @@ async function handleRequest(req: NextRequest, requestId: string, t0: number): P
   let pdfText  = '';
   let numPages = 0;
   try {
-    const parsed = await pdfParse(buffer);
-    pdfText  = String(parsed.text  ?? '').slice(0, MAX_TEXT_CHARS);
-    numPages = Number(parsed.numpages ?? 0);
-    console.log(`[analyze][${requestId}] pdf-parse: ${pdfText.length} chars, ${numPages} pages (+${Date.now()-t0}ms)`);
+    const parsed  = await parsePdf(buffer);
+    numPages = parsed.totalPages;
+    pdfText  = parsed.pages.map(p => p.text).join('\n\n').slice(0, MAX_TEXT_CHARS);
+    console.log(`[analyze][${requestId}] parsePdf: ${pdfText.length} chars, ${numPages} pages (+${Date.now()-t0}ms)`);
   } catch (e) {
-    console.error(`[analyze][${requestId}] pdf-parse failed:`, String(e));
+    console.error(`[analyze][${requestId}] parsePdf failed:`, String(e));
   }
 
   const isScan    = pdfText.trim().length < 200;
