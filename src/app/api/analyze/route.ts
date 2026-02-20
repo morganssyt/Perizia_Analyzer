@@ -3,9 +3,11 @@
  *
  * Pipeline:
  *  1. Accept FormData PDF
- *  2. Extract text locally with extractPdfText (3-engine: pdf-parse + pdfjs-dist)
- *  3. client.messages.create (claude-haiku-4-5-20251001)
- *  4. Validate JSON with Zod
+ *  2. Extract text per-page  (extractPdfPages — 2-engine: pdf-parse custom + default)
+ *  3. Rank + select relevant pages (rankPages + selectPages — anti-cover/copyright)
+ *  4. Build anchored text ("--- PAGE N ---" format)
+ *  5. client.messages.create (claude-haiku-4-5-20251001)
+ *  6. Validate JSON with Zod
  */
 
 export const maxDuration = 60;
@@ -15,7 +17,8 @@ export const runtime     = 'nodejs';
 import { NextRequest, NextResponse } from 'next/server';
 import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
-import { extractPdfText } from '@/lib/extract-pdf-text';
+import { extractPdfPages } from '@/lib/extract-pdf-pages';
+import { rankPages, selectPages } from '@/lib/rank-pages';
 
 // ---------------------------------------------------------------------------
 // Staging flag — expose pdfDebug in preview/staging, never in production
@@ -65,10 +68,21 @@ export interface DebugInfo {
   ocrMethod?: string; ocrPages?: OcrPageDebug[]; ocrAvgChars?: number;
   ocrEscalated?: boolean; expansionPages?: number[];
   reasonForVision?: string; visionPagesAnalyzed?: number[]; imagesRendered?: number;
-  /** extraction engine used (pdf-parse-custom | pdf-parse-default | pdfjs-direct | failed) */
+  /** extraction engine used */
   extractionEngine?: string;
-  /** error from extractPdfText when engine = 'failed' */
+  /** error from extractPdfPages when engine = 'failed' */
   extractionError?: string;
+}
+
+export interface Evidence {
+  usedPages: number[];
+  pageSnippets: { page: number; snippet: string }[];
+  extractionStats: {
+    totalPages: number;
+    totalTextLen: number;
+    usedTextLen: number;
+    penalizedPages: { page: number; reason: string }[];
+  };
 }
 
 interface Citation  { page: number; snippet: string; keyword?: string; }
@@ -83,21 +97,22 @@ export type AnalysisResult = {
   riassunto: { paragrafo1: string; paragrafo2: string; paragrafo3: string };
   debug: DebugInfo;
   meta:  Meta;
+  evidence?: Evidence;
 };
 
 /** Returned only in STAGING (VERCEL_ENV=preview or STAGING=true). Never in production. */
 export interface PdfDebugInfo {
-  ok:                 boolean;
-  fileBytes:          number;
-  magic:              string;
-  pdfPages:           number;
+  ok:                  boolean;
+  fileBytes:           number;
+  magic:               string;
+  pdfPages:            number;
   extractedTextLength: number;
-  extractionEngine:   string;
-  error?:             string;
+  extractionEngine:    string;
+  error?:              string;
 }
 
 // ---------------------------------------------------------------------------
-// Zod schema
+// Zod schema — Claude output format (unchanged)
 // ---------------------------------------------------------------------------
 
 const FieldBase = z.object({
@@ -114,7 +129,7 @@ const Schema = z.object({
 });
 
 // ---------------------------------------------------------------------------
-// System prompt
+// System prompt (unchanged)
 // ---------------------------------------------------------------------------
 
 const SYSTEM_PROMPT = `You are a legal real estate auction analyst.
@@ -161,7 +176,7 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3, baseDelayMs = 
 
 const MAX_BYTES      = (parseInt(process.env.MAX_PDF_MB        ?? '15',    10) || 15)    * 1024 * 1024;
 const LLM_TIMEOUT_MS =  parseInt(process.env.ANALYZE_TIMEOUT_MS ?? '50000', 10) || 50_000;
-const MAX_TEXT_CHARS = 120_000;
+const MAX_TEXT_CHARS = 80_000;
 const MODEL          = 'claude-haiku-4-5-20251001';
 
 function makeId() { return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`; }
@@ -207,7 +222,6 @@ async function handleRequest(req: NextRequest, requestId: string, t0: number): P
 
   const buffer = Buffer.from(await file.arrayBuffer());
 
-  // ── Structured logging ────────────────────────────────────────────────────
   const magic      = buffer.slice(0, 8).toString('hex');
   const magicAscii = buffer.slice(0, 5).toString('ascii');
   console.log(
@@ -215,30 +229,79 @@ async function handleRequest(req: NextRequest, requestId: string, t0: number): P
     `magic="${magicAscii}" (${magic}) (+${Date.now()-t0}ms)`,
   );
 
-  // ── Extract PDF text ──────────────────────────────────────────────────────
-  const extracted = await extractPdfText(buffer);
+  // ── Per-page extraction ──────────────────────────────────────────────────
+  const extracted = await extractPdfPages(buffer);
+  const { totalPages, pages, engine: extractionEngine, error: extractionError } = extracted;
+
+  const totalTextLen = pages.reduce((acc, p) => acc + p.text.trim().length, 0);
 
   console.log(
-    `[analyze][${requestId}] extraction: engine=${extracted.engine} ` +
-    `pages=${extracted.pages} textLen=${extracted.text.length} ` +
+    `[analyze][${requestId}] extraction: engine=${extractionEngine} ` +
+    `totalPages=${totalPages} pageCount=${pages.length} totalTextLen=${totalTextLen} ` +
     `(+${Date.now()-t0}ms)` +
-    (extracted.error ? ` ERROR: ${extracted.error}` : ''),
+    (extractionError ? ` ERROR: ${extractionError}` : ''),
   );
 
-  const numPages = extracted.pages;
-  const pdfText  = extracted.text.slice(0, MAX_TEXT_CHARS);
-
-  if (extracted.engine === 'failed') {
+  // ── Fail-fast: scan / protected PDF ──────────────────────────────────────
+  if (totalTextLen < 300) {
     console.error(
-      `[analyze][${requestId}] EXTRACTION FAILED — file=${file.name} ` +
-      `size=${file.size}B error=${extracted.error}`,
+      `[analyze][${requestId}] FAIL-FAST totalTextLen=${totalTextLen} — ` +
+      `PDF probabilmente scannerizzato o protetto`,
+    );
+    return err(
+      requestId,
+      'PDF probabilmente scannerizzato o protetto — testo non leggibile.',
+      422,
+      {
+        detail: `Estratti ${totalTextLen} caratteri totali su ${totalPages} pagine. ` +
+                `Il PDF non contiene testo selezionabile.`,
+      },
     );
   }
 
-  const isScan  = pdfText.trim().length < 200;
-  const userMsg = isScan
-    ? 'PDF senza testo (scansionato o protetto). Restituisci tutti i campi con status not_found e confidence 0.'
-    : `Analizza questa perizia immobiliare:\n\n${pdfText}`;
+  // ── Rank + select pages ──────────────────────────────────────────────────
+  const scored           = rankPages(pages);
+  const selectedPageNums = selectPages(scored, totalPages);
+  const pagesMap         = Object.fromEntries(pages.map((p) => [p.page, p]));
+  const penalizedPages   = scored
+    .filter((s) => s.penalized)
+    .map((s) => ({ page: s.page, reason: s.penaltyReason ?? 'unknown' }));
+
+  const usedTextLen = selectedPageNums.reduce(
+    (acc, pg) => acc + (pagesMap[pg]?.text.trim().length ?? 0), 0,
+  );
+
+  console.log(
+    `[analyze][${requestId}] ranking: selected=[${selectedPageNums.join(',')}] ` +
+    `usedTextLen=${usedTextLen} ` +
+    `penalized=[${penalizedPages.map((p) => `p${p.page}:${p.reason}`).join(',') || 'none'}]`,
+  );
+
+  if (usedTextLen < 300) {
+    console.error(
+      `[analyze][${requestId}] FAIL-FAST usedTextLen=${usedTextLen} — testo rilevante insufficiente`,
+    );
+    return err(
+      requestId,
+      'Testo rilevante insufficiente — il PDF potrebbe contenere solo copertina o copyright.',
+      422,
+      {
+        detail: `Estratti ${usedTextLen} caratteri utili su ${selectedPageNums.length} ` +
+                `pagine selezionate (${totalTextLen} totali).`,
+      },
+    );
+  }
+
+  // ── Build anchored text (--- PAGE N --- format) ──────────────────────────
+  let anchoredText = selectedPageNums
+    .map((pg) => `--- PAGE ${pg} ---\n${pagesMap[pg]?.text ?? ''}`)
+    .join('\n\n');
+
+  if (anchoredText.length > MAX_TEXT_CHARS) {
+    anchoredText = anchoredText.slice(0, MAX_TEXT_CHARS);
+  }
+
+  const userMsg = `Analizza questa perizia immobiliare (testo estratto per pagina):\n\n${anchoredText}`;
 
   // ── Claude messages.create ────────────────────────────────────────────────
   const client = new Anthropic({
@@ -248,20 +311,26 @@ async function handleRequest(req: NextRequest, requestId: string, t0: number): P
 
   let rawText = '';
   try {
-    console.log(`[analyze][${requestId}] messages.create model=${MODEL} isScan=${isScan}`);
+    console.log(
+      `[analyze][${requestId}] messages.create model=${MODEL} ` +
+      `pages=${selectedPageNums.length} promptLen=${userMsg.length}`,
+    );
 
     const response = await withRetry(() =>
       client.messages.create({
-        model:      MODEL,
-        max_tokens: 2048,
+        model:       MODEL,
+        max_tokens:  2048,
         temperature: 0,
-        system:     SYSTEM_PROMPT,
-        messages:   [{ role: 'user', content: userMsg }],
+        system:      SYSTEM_PROMPT,
+        messages:    [{ role: 'user', content: userMsg }],
       })
     );
 
     rawText = response.content[0]?.type === 'text' ? response.content[0].text : '';
-    console.log(`[analyze][${requestId}] done rawText.length=${rawText.length} stop=${response.stop_reason} (+${Date.now()-t0}ms)`);
+    console.log(
+      `[analyze][${requestId}] done rawText.length=${rawText.length} ` +
+      `stop=${response.stop_reason} (+${Date.now()-t0}ms)`,
+    );
   } catch (e) {
     const isAborted = e instanceof Error && (e.name === 'AbortError' || e.name === 'APIConnectionTimeoutError');
     const isRL      = e instanceof Anthropic.APIError && e.status === 429;
@@ -286,22 +355,43 @@ async function handleRequest(req: NextRequest, requestId: string, t0: number): P
 
   const data = v.data;
 
-  // ── Response ──────────────────────────────────────────────────────────────
+  // ── Build response ────────────────────────────────────────────────────────
+  const avgCharsPerPage = totalPages > 0 ? Math.round(totalTextLen / totalPages) : 0;
+
   const debug: DebugInfo = {
-    totalPages: numPages, totalChars: pdfText.length, charsPerPage: [],
-    textCoverage: numPages > 0 ? Math.min(pdfText.length / (numPages * 2000), 1) : 0,
-    isScanDetected: isScan, hitsPerCategory: {},
-    first2000chars: pdfText.slice(0, 2000), last2000chars: pdfText.slice(-2000),
+    totalPages,
+    totalChars:          totalTextLen,
+    charsPerPage:        pages.map((p) => ({ page: p.page, chars: p.text.length })),
+    textCoverage:        avgCharsPerPage,
+    isScanDetected:      false,
+    hitsPerCategory:     {},
+    first2000chars:      anchoredText.slice(0, 2000),
+    last2000chars:       anchoredText.slice(-2000),
     promptPayloadLength: userMsg.length,
-    extractionEngine: extracted.engine,
-    extractionError:  extracted.error,
+    extractionEngine,
+    extractionError,
+  };
+
+  const evidence: Evidence = {
+    usedPages:    selectedPageNums,
+    pageSnippets: selectedPageNums.map((pg) => ({
+      page:    pg,
+      snippet: (pagesMap[pg]?.text ?? '').slice(0, 500),
+    })),
+    extractionStats: {
+      totalPages,
+      totalTextLen,
+      usedTextLen,
+      penalizedPages,
+    },
   };
 
   const meta: Meta = {
     analysis_mode:  'pdf_direct',
-    total_pages:    numPages,
-    pages_analyzed: numPages,
-    notes: isScan ? 'PDF scansionato' : `Claude ${MODEL}`,
+    total_pages:    totalPages,
+    pages_analyzed: selectedPageNums.length,
+    pages_list:     selectedPageNums,
+    notes:          `Claude ${MODEL} · ${selectedPageNums.length}/${totalPages} pag.`,
   };
 
   const result: AnalysisResult = {
@@ -310,18 +400,18 @@ async function handleRequest(req: NextRequest, requestId: string, t0: number): P
     costi_oneri:      { ...data.costi_oneri,      citations: [], candidates: [] },
     difformita:       { ...data.difformita,        citations: [], candidates: [] },
     riassunto:        data.riassunto,
-    debug, meta,
+    debug, meta, evidence,
   };
 
   // ── Staging: include pdfDebug for diagnostics (never in production) ────────
   const pdfDebug: PdfDebugInfo | undefined = IS_STAGING ? {
-    ok:                  extracted.engine !== 'failed',
+    ok:                  extractionEngine !== 'failed',
     fileBytes:           file.size,
     magic:               magicAscii,
-    pdfPages:            numPages,
-    extractedTextLength: pdfText.length,
-    extractionEngine:    extracted.engine,
-    error:               extracted.error,
+    pdfPages:            totalPages,
+    extractedTextLength: totalTextLen,
+    extractionEngine,
+    error:               extractionError,
   } : undefined;
 
   console.log(`[analyze][${requestId}] OK total=${Date.now()-t0}ms staging=${IS_STAGING}`);

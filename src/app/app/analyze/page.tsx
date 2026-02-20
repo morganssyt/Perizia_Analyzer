@@ -10,6 +10,7 @@ import type {
   PageRenderDebug,
   OcrPageDebug,
   PdfDebugInfo,
+  Evidence,
 } from '@/app/api/analyze/route';
 
 import { usePersistence } from '@/hooks/usePersistence';
@@ -370,6 +371,83 @@ function DebugPanel({ debug, meta }: { debug: DebugInfo; meta?: Meta }) {
           {debug.first2000chars || '(vuoto — probabile PDF solo immagine)'}
         </pre>
       </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Used pages panel — shows which pages were analyzed and their text previews
+// ─────────────────────────────────────────────────────────────────────────────
+
+function UsedPagesPanel({ evidence, fileUrl }: { evidence: Evidence; fileUrl: string | null }) {
+  const [expandedPage, setExpandedPage] = useState<number | null>(null);
+  const { usedPages, pageSnippets, extractionStats } = evidence;
+
+  return (
+    <div className="bg-slate-50 border border-slate-100 rounded-2xl p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">
+          Pagine analizzate
+        </p>
+        <span className="text-xs text-slate-400">
+          {usedPages.length}/{extractionStats.totalPages} pag
+          {' · '}
+          {(extractionStats.usedTextLen / 1000).toFixed(0)}K car
+        </span>
+      </div>
+
+      {/* Page number chips */}
+      <div className="flex flex-wrap gap-1.5">
+        {usedPages.map((p) => (
+          <button
+            key={p}
+            onClick={() => setExpandedPage(expandedPage === p ? null : p)}
+            className={`px-2.5 py-1 rounded-full text-xs font-semibold border transition-all ${
+              expandedPage === p
+                ? 'bg-blue-700 text-white border-blue-700'
+                : 'bg-white text-slate-600 border-slate-200 hover:border-blue-300 hover:text-blue-700'
+            }`}
+          >
+            {p}
+          </button>
+        ))}
+      </div>
+
+      {/* Accordion: text snippet + open-in-PDF link */}
+      {expandedPage !== null && (() => {
+        const s = pageSnippets.find((x) => x.page === expandedPage);
+        return (
+          <div className="space-y-2">
+            {s && s.snippet && (
+              <pre className="bg-white border border-slate-100 rounded-xl p-3 text-xs text-slate-600 whitespace-pre-wrap leading-relaxed max-h-36 overflow-auto font-mono">
+                {s.snippet}
+              </pre>
+            )}
+            {fileUrl && (
+              <a
+                href={`${fileUrl}#page=${expandedPage}`}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1.5 text-xs text-blue-600 hover:text-blue-800 font-medium"
+              >
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                    d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                </svg>
+                Apri PDF a pagina {expandedPage}
+              </a>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* Warning if any pages were penalized */}
+      {extractionStats.penalizedPages.length > 0 && (
+        <p className="text-xs text-amber-600">
+          Escluse {extractionStats.penalizedPages.length} pagine con copyright/watermark
+          {' '}(pag. {extractionStats.penalizedPages.map((p) => p.page).join(', ')})
+        </p>
+      )}
     </div>
   );
 }
@@ -896,6 +974,11 @@ export default function AnalizzaPage() {
 
                 {/* Esito + 2x2 grid */}
                 <EsitoCard result={result} />
+
+                {/* Used pages panel */}
+                {result.evidence && (
+                  <UsedPagesPanel evidence={result.evidence} fileUrl={fileUrl} />
+                )}
 
                 {/* Field sections */}
                 {FIELDS.map((f) => {
