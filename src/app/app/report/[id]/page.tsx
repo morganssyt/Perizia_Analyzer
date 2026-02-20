@@ -7,6 +7,7 @@ import { getHistoryEntry, getEsitoFromResult, formatDate, type HistoryEntry } fr
 import FieldSection from '@/components/results/FieldSection';
 import SummarySection from '@/components/results/SummarySection';
 import ExportMenu from '@/components/export/ExportMenu';
+import { usePersistenceById } from '@/hooks/usePersistenceById';
 import type { AnalysisResult } from '@/app/api/analyze/route';
 
 const FIELDS = [
@@ -99,6 +100,8 @@ export default function ReportPage() {
   const [entry, setEntry] = useState<HistoryEntry | null>(null);
   const [loaded, setLoaded] = useState(false);
 
+  const { notes, verified, setNote, setVerified } = usePersistenceById(id ?? null);
+
   useEffect(() => {
     setEntry(getHistoryEntry(id));
     setLoaded(true);
@@ -144,7 +147,7 @@ export default function ReportPage() {
             <h1 className="text-xl font-bold text-slate-900 truncate">{entry.fileName}</h1>
             <p className="text-sm text-slate-400 mt-1">{formatDate(entry.analyzedAt)}</p>
           </div>
-          <ExportMenu result={result} fileName={entry.fileName} notes={{}} verified={{}} />
+          <ExportMenu result={result} fileName={entry.fileName} notes={notes} verified={verified} />
         </div>
       </div>
 
@@ -163,7 +166,9 @@ export default function ReportPage() {
             <FieldSection
               key={f.key} fieldKey={f.key} title={f.title} icon={f.icon}
               description={f.description} field={field}
-              note="" verified={false} onNoteChange={() => {}} onVerifiedChange={() => {}}
+              note={notes[f.key] ?? ''} verified={!!verified[f.key]}
+              onNoteChange={(v) => setNote(f.key, v)}
+              onVerifiedChange={(v) => setVerified(f.key, v)}
             />
           );
         })}

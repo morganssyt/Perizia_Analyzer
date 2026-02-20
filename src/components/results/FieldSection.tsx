@@ -33,6 +33,8 @@ interface Props {
   verified: boolean;
   onNoteChange: (v: string) => void;
   onVerifiedChange: (v: boolean) => void;
+  /** When provided, citation chips get a "Vai a pagina" button that navigates the PDF viewer */
+  onGoToPage?: (page: number) => void;
 }
 
 export default function FieldSection({
@@ -44,6 +46,7 @@ export default function FieldSection({
   verified,
   onNoteChange,
   onVerifiedChange,
+  onGoToPage,
 }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [copiedField, setCopiedField] = useState(false);
@@ -165,23 +168,39 @@ export default function FieldSection({
             )}
 
             {/* Citations */}
-            {hasCitations && (
+            {hasCitations ? (
               <div className="space-y-1 mt-1">
                 {(field.citations ?? []).slice(0, 3).map((c, i) => (
                   <div
                     key={i}
                     className="text-xs bg-blue-50 border border-blue-100 rounded px-2.5 py-1.5 leading-snug"
                   >
-                    <span className="font-semibold text-blue-600">Pagina {c.page}</span>
-                    {c.keyword && (
-                      <span className="ml-1 text-blue-400 font-normal">[{c.keyword}]</span>
-                    )}
-                    <span className="ml-1 text-gray-600">
-                      — &ldquo;{c.snippet.slice(0, 160)}&rdquo;
+                    <div className="flex items-center justify-between gap-2 mb-0.5">
+                      <div>
+                        <span className="font-semibold text-blue-600">Pagina {c.page}</span>
+                        {c.keyword && (
+                          <span className="ml-1 text-blue-400 font-normal">[{c.keyword}]</span>
+                        )}
+                      </div>
+                      {onGoToPage && (
+                        <button
+                          onClick={() => onGoToPage(c.page)}
+                          className="text-blue-500 hover:text-blue-700 underline text-xs flex-shrink-0"
+                        >
+                          Vai →
+                        </button>
+                      )}
+                    </div>
+                    <span className="text-gray-600">
+                      &ldquo;{c.snippet.slice(0, 160)}&rdquo;
                     </span>
                   </div>
                 ))}
               </div>
+            ) : (
+              <p className="text-xs text-slate-400 italic mt-1">
+                Evidenze testuali non disponibili in questa versione.
+              </p>
             )}
           </>
         )}
