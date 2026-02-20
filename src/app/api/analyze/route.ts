@@ -1,24 +1,24 @@
 /**
- * /api/analyze — Direct PDF extraction via OpenAI Responses API.
+ * /api/analyze — PDF extraction via OpenAI Responses API.
  *
  * Pipeline:
  *  1. Accept FormData PDF
- *  2. Upload PDF to OpenAI Files API
- *  3. Single client.responses.create call (model reads PDF natively)
+ *  2. Extract text locally with pdf-parse (no binary upload to OpenAI)
+ *  3. Single client.responses.create call with extracted text
  *  4. Validate JSON with Zod
- *  5. Cleanup uploaded file
- *
- * No rendering, no OCR, no image conversion, no multi-call batching.
  */
 
-// Allow up to 2 minutes on Vercel Pro
-export const maxDuration = 120;
+export const maxDuration = 60;
 export const dynamic     = 'force-dynamic';
 export const runtime     = 'nodejs';
 
 import { NextRequest, NextResponse } from 'next/server';
-import OpenAI, { toFile } from 'openai';
+import OpenAI from 'openai';
 import { z } from 'zod';
+
+// pdf-parse is a CommonJS module — require() avoids ESM issues
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const pdfParse = require('pdf-parse/lib/pdf-parse.js');
 
 // ---------------------------------------------------------------------------
 // Exported types (consumed by page.tsx)
@@ -216,10 +216,8 @@ async function withRetry<T>(
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractOutputText(response: any): string {
-  // Convenience property added in recent SDK versions
   if (typeof response.output_text === 'string') return response.output_text;
 
-  // Manual extraction from output array
   if (Array.isArray(response.output)) {
     return (response.output as unknown[])
       .filter((o): o is { type: string; content: unknown[] } =>
@@ -237,27 +235,12 @@ function extractOutputText(response: any): string {
 }
 
 // ---------------------------------------------------------------------------
-// Compat helper: sdk <4.30 uses .del(), newer adds .delete() alias
-// ---------------------------------------------------------------------------
-
-function deleteFile(client: OpenAI, fileId: string): Promise<unknown> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const files = client.files as any;
-  const fn: ((id: string) => Promise<unknown>) | undefined =
-    typeof files.delete === 'function' ? files.delete : files.del;
-  if (!fn) return Promise.resolve();
-  return fn.call(files, fileId);
-}
-
-// ---------------------------------------------------------------------------
 // Route handler
 // ---------------------------------------------------------------------------
 
-// File size limit: MAX_PDF_MB env var (default 15 MB)
-const MAX_BYTES = (parseInt(process.env.MAX_PDF_MB ?? '15', 10) || 15) * 1024 * 1024;
-
-// OpenAI call timeout: ANALYZE_TIMEOUT_MS env var (default 90 s)
-const OPENAI_TIMEOUT_MS = parseInt(process.env.ANALYZE_TIMEOUT_MS ?? '90000', 10) || 90_000;
+const MAX_BYTES       = (parseInt(process.env.MAX_PDF_MB      ?? '15',    10) || 15)     * 1024 * 1024;
+const OPENAI_TIMEOUT_MS = parseInt(process.env.ANALYZE_TIMEOUT_MS ?? '55000', 10) || 55_000;
+const MAX_TEXT_CHARS  = 180_000;
 
 function makeId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
@@ -273,7 +256,6 @@ export async function POST(req: NextRequest) {
   const t0        = Date.now();
   console.log(`[analyze][${requestId}] START`);
 
-  // Top-level catch so the route ALWAYS returns JSON, never an HTML error page
   try {
     return await handleRequest(req, requestId, t0);
   } catch (e) {
@@ -286,7 +268,7 @@ export async function POST(req: NextRequest) {
 }
 
 async function handleRequest(req: NextRequest, requestId: string, t0: number): Promise<NextResponse> {
-  // ── Env check ─────────────────────────────────────────────────────────────
+  // ── Env check ──────────────────────────────────────────────────────────────
   if (!process.env.OPENAI_API_KEY) {
     return err(requestId, 'OPENAI_API_KEY mancante in .env — il server non può chiamare OpenAI.', 500);
   }
@@ -304,43 +286,44 @@ async function handleRequest(req: NextRequest, requestId: string, t0: number): P
     return err(requestId, 'Nessun file fornito nel form (campo "file" mancante).', 400);
   }
 
-  console.log(`[analyze][${requestId}] file="${file.name}" size=${file.size} maxBytes=${MAX_BYTES}`);
+  console.log(`[analyze][${requestId}] file="${file.name}" size=${file.size}`);
 
   if (file.size > MAX_BYTES) {
     return err(requestId,
-      `File troppo grande: ${(file.size / 1024 / 1024).toFixed(1)} MB (limite ${Math.round(MAX_BYTES / 1024 / 1024)} MB). ` +
-      `Aumenta MAX_PDF_MB in .env per consentire file più grandi.`,
+      `File troppo grande: ${(file.size / 1024 / 1024).toFixed(1)} MB (limite ${Math.round(MAX_BYTES / 1024 / 1024)} MB).`,
       413,
     );
   }
 
   const arrayBuffer = await file.arrayBuffer();
   const buffer      = Buffer.from(arrayBuffer);
-  const client      = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  // ── Upload PDF to OpenAI Files API ────────────────────────────────────────
-  console.log(`[analyze][${requestId}] uploading to OpenAI files…`);
-  let uploadedFile: OpenAI.FileObject;
+  // ── Extract text from PDF locally ─────────────────────────────────────────
+  console.log(`[analyze][${requestId}] parsing PDF text…`);
+  let pdfText  = '';
+  let numPages = 0;
   try {
-    uploadedFile = await client.files.create({
-      file:    await toFile(buffer, file.name || 'perizia.pdf', { type: 'application/pdf' }),
-      purpose: 'user_data',
-    });
-    console.log(`[analyze][${requestId}] uploaded fileId=${uploadedFile.id} (+${Date.now() - t0}ms)`);
+    const parsed = await pdfParse(buffer);
+    pdfText  = (parsed.text  ?? '').slice(0, MAX_TEXT_CHARS);
+    numPages = parsed.numpages ?? 0;
+    console.log(`[analyze][${requestId}] extracted ${pdfText.length} chars, ${numPages} pages (+${Date.now() - t0}ms)`);
   } catch (e) {
-    const detail = e instanceof OpenAI.APIError
-      ? `OpenAI ${e.status}: ${e.message}`
-      : String(e);
-    return err(requestId, `Upload del PDF a OpenAI fallito: ${detail}`, 502, { detail });
+    console.error(`[analyze][${requestId}] pdf-parse error`, String(e));
   }
 
-  // ── Single Responses API call ─────────────────────────────────────────────
+  const isScan = pdfText.trim().length < 200;
+  const inputText = isScan
+    ? 'PDF senza testo estraibile (probabilmente scansionato o protetto). Restituisci tutti i campi con status not_found e confidence 0.'
+    : `Analizza questa perizia immobiliare e restituisci SOLO JSON valido nel formato specificato.\n\n${pdfText}`;
+
+  // ── Responses API call ─────────────────────────────────────────────────────
+  const client     = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const controller = new AbortController();
   const timeoutId  = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
 
   let rawText = '';
   try {
-    console.log(`[analyze][${requestId}] calling responses.create (timeout=${OPENAI_TIMEOUT_MS}ms)…`);
+    console.log(`[analyze][${requestId}] calling responses.create…`);
 
     const response = await withRetry(() =>
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -351,16 +334,7 @@ async function handleRequest(req: NextRequest, requestId: string, t0: number): P
           input: [
             {
               role: 'user',
-              content: [
-                {
-                  type: 'input_text',
-                  text: 'Analizza questa perizia immobiliare e restituisci SOLO JSON valido nel formato specificato.',
-                },
-                {
-                  type:    'input_file',
-                  file_id: uploadedFile.id,
-                },
-              ],
+              content: [{ type: 'input_text', text: inputText }],
             },
           ],
           text: { format: { type: 'json_object' } },
@@ -370,30 +344,22 @@ async function handleRequest(req: NextRequest, requestId: string, t0: number): P
     );
 
     rawText = extractOutputText(response);
-    console.log(`[analyze][${requestId}] responses.create done, rawText.length=${rawText.length} (+${Date.now() - t0}ms)`);
+    console.log(`[analyze][${requestId}] done rawText.length=${rawText.length} (+${Date.now() - t0}ms)`);
   } catch (e) {
     const isAborted   = e instanceof Error && e.name === 'AbortError';
     const isRateLimit = e instanceof OpenAI.APIError && e.status === 429;
     const detail      = e instanceof OpenAI.APIError
       ? `OpenAI ${e.status}: ${e.message}`
       : String(e);
-    await deleteFile(client, uploadedFile.id).catch(() => {});
-    if (isAborted) {
-      return err(requestId, `Timeout analisi: il modello non ha risposto entro ${OPENAI_TIMEOUT_MS / 1000}s.`, 504, { detail });
-    }
-    if (isRateLimit) {
-      return err(requestId, 'Rate limit OpenAI raggiunto dopo 3 tentativi. Riprova tra qualche minuto.', 429, { detail });
-    }
-    return err(requestId, `Errore API OpenAI durante l'analisi: ${detail}`, 502, { detail });
+    if (isAborted)   return err(requestId, `Timeout: il modello non ha risposto entro ${OPENAI_TIMEOUT_MS / 1000}s.`, 504, { detail });
+    if (isRateLimit) return err(requestId, 'Rate limit OpenAI raggiunto. Riprova tra qualche minuto.', 429, { detail });
+    return err(requestId, `Errore API OpenAI: ${detail}`, 502, { detail });
   } finally {
     clearTimeout(timeoutId);
   }
 
-  // Cleanup uploaded file (best-effort, non-blocking)
-  deleteFile(client, uploadedFile.id).catch(() => {});
-
   if (!rawText.trim()) {
-    return err(requestId, 'Risposta OpenAI vuota: il modello non ha restituito testo. Riprova.', 502);
+    return err(requestId, 'Risposta OpenAI vuota. Riprova.', 502);
   }
 
   // ── Parse JSON ─────────────────────────────────────────────────────────────
@@ -404,10 +370,10 @@ async function handleRequest(req: NextRequest, requestId: string, t0: number): P
     return err(requestId, 'Risposta OpenAI non era JSON valido.', 502, { raw: rawText.slice(0, 500) });
   }
 
-  // ── Validate with Zod ─────────────────────────────────────────────────────
+  // ── Validate with Zod ──────────────────────────────────────────────────────
   const validation = DirectPdfSchema.safeParse(parsed);
   if (!validation.success) {
-    return err(requestId, 'Schema risposta non valido (campi mancanti o tipo errato).', 502, {
+    return err(requestId, 'Schema risposta non valido.', 502, {
       issues: validation.error.issues,
       raw:    parsed,
     });
@@ -417,22 +383,22 @@ async function handleRequest(req: NextRequest, requestId: string, t0: number): P
 
   // ── Build response ─────────────────────────────────────────────────────────
   const debug: DebugInfo = {
-    totalPages:          0,
-    totalChars:          0,
+    totalPages:          numPages,
+    totalChars:          pdfText.length,
     charsPerPage:        [],
-    textCoverage:        0,
-    isScanDetected:      false,
+    textCoverage:        numPages > 0 ? Math.min(pdfText.length / (numPages * 2000), 1) : 0,
+    isScanDetected:      isScan,
     hitsPerCategory:     {},
-    first2000chars:      '',
-    last2000chars:       '',
-    promptPayloadLength: 0,
+    first2000chars:      pdfText.slice(0, 2000),
+    last2000chars:       pdfText.slice(-2000),
+    promptPayloadLength: inputText.length,
   };
 
   const meta: Meta = {
     analysis_mode:  'pdf_direct',
-    total_pages:    0,
-    pages_analyzed: 0,
-    notes:          'Analisi PDF diretta (no OCR pipeline)',
+    total_pages:    numPages,
+    pages_analyzed: numPages,
+    notes:          isScan ? 'PDF scansionato — testo non estraibile' : 'Analisi testo PDF',
   };
 
   const result: AnalysisResult = {
