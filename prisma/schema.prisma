@@ -1,0 +1,65 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model Document {
+  id           String   @id @default(uuid())
+  filename     String
+  filepath     String
+  uploadedAt   DateTime @default(now())
+  pages        Int      @default(0)
+  status       String   @default("pending") // pending | processing | completed | error
+  errorMessage String?
+
+  extraction   ExtractionResult?
+  reviews      ReviewEntry[]
+}
+
+model ExtractionResult {
+  id             String   @id @default(uuid())
+  documentId     String   @unique
+  document       Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  // Stored as JSON strings
+  antecedentActs String   @default("[]")   // JSON: AntecedentAct[]
+  legalCosts     String   @default("[]")   // JSON: LegalCost[]
+  irregularities String   @default("[]")   // JSON: Irregularity[]
+  expertValue    String   @default("{}")   // JSON: ExpertValue
+
+  // 3 summary paragraphs
+  summaryAsset   String   @default("")
+  summaryRisks   String   @default("")
+  summaryActions String   @default("")
+
+  // Debug info: textCoverage, keyword matches, per-page stats (JSON)
+  debugInfo      String   @default("{}")
+  // Pipeline execution logs (newline-separated)
+  pipelineLogs   String   @default("")
+
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model ReviewEntry {
+  id         String   @id @default(uuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  fieldKey   String   // antecedentActs | legalCosts | irregularities | expertValue
+  itemIndex  Int      @default(0)
+  verified   Boolean  @default(false)
+  userEdit   String?  // JSON: user correction
+  notes      String?
+  reviewer   String?
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([documentId, fieldKey, itemIndex])
+}
