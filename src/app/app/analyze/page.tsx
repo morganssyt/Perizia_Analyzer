@@ -90,13 +90,19 @@ type FieldKey = (typeof FIELDS)[number]['key'];
 // ─────────────────────────────────────────────────────────────────────────────
 
 function friendlyErrorMessage(status: number | undefined, raw: string): string {
-  if (status === 413) return 'Il file è troppo grande. La dimensione massima è 15 MB.';
-  if (status === 429) return 'Troppe richieste al momento. Attendi qualche secondo e riprova.';
-  if (status === 504 || status === 503) return 'Il server ha impiegato troppo tempo. Riprova tra qualche istante.';
-  if (status === 500) return 'Errore interno del server durante l\'analisi. Riprova tra qualche minuto.';
-  if (status === 400) return 'Richiesta non valida. Assicurati di caricare un file PDF valido.';
-  if (!status) return 'Impossibile raggiungere il server. Controlla la connessione internet.';
-  return raw || `Errore HTTP ${status}. Riprova tra qualche minuto.`;
+  const prefix = status ? `HTTP ${status} — ` : '';
+  const fallbacks: Record<number, string> = {
+    400: 'Richiesta non valida.',
+    413: 'File troppo grande (max 15 MB).',
+    422: 'PDF non analizzabile (scansione o testo non estraibile).',
+    429: 'Troppe richieste. Attendi qualche secondo e riprova.',
+    500: 'Errore interno del server.',
+    502: 'Errore upstream (Claude API).',
+    503: 'Servizio non disponibile. Riprova tra qualche istante.',
+    504: 'Timeout: il server ha impiegato troppo tempo.',
+  };
+  if (!status) return raw || 'Impossibile raggiungere il server. Controlla la connessione internet.';
+  return prefix + (raw || fallbacks[status] || `Errore sconosciuto.`);
 }
 
 function getEsito(result: AnalysisResult): { label: string; color: 'verde' | 'giallo' | 'rosso' } {
@@ -1025,19 +1031,27 @@ export default function AnalizzaPage() {
                       d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z"
                       clipRule="evenodd" />
                   </svg>
-                  <div>
-                    <p className="text-red-700 text-sm font-medium">{error}</p>
+                  <div className="min-w-0 flex-1">
+                    {apiError?.httpStatus && (
+                      <span className="inline-block text-xs font-mono font-bold bg-red-200 text-red-800 rounded px-1.5 py-0.5 mr-1.5 mb-1">
+                        HTTP {apiError.httpStatus}
+                      </span>
+                    )}
+                    <p className="text-red-700 text-sm font-medium break-words">{error}</p>
                     {apiError?.requestId && (
                       <p className="text-red-400 text-xs font-mono mt-0.5">ID: {apiError.requestId}</p>
                     )}
                   </div>
                 </div>
-                {(apiError?.detail || apiError?.renderDebug || apiError?.ocrDebug) && (
+                {(apiError?.detail || apiError?.issues) && (
                   <details className="text-xs">
                     <summary className="text-red-400 cursor-pointer hover:text-red-600">Dettagli tecnici</summary>
                     <div className="mt-1.5 space-y-1">
                       {apiError?.detail && (
-                        <p className="text-red-600 font-mono bg-red-100 rounded px-2 py-1 break-all">{apiError.detail}</p>
+                        <p className="text-red-600 font-mono bg-red-100 rounded px-2 py-1 break-all">{String(apiError.detail)}</p>
+                      )}
+                      {apiError?.issues && (
+                        <p className="text-red-600 font-mono bg-red-100 rounded px-2 py-1 break-all">{JSON.stringify(apiError.issues, null, 2)}</p>
                       )}
                     </div>
                   </details>

@@ -205,7 +205,7 @@ export async function POST(req: NextRequest) {
 async function handleRequest(req: NextRequest, requestId: string, t0: number): Promise<NextResponse> {
 
   if (!process.env.ANTHROPIC_API_KEY) {
-    return err(requestId, 'ANTHROPIC_API_KEY mancante.', 500);
+    return err(requestId, 'ANTHROPIC_API_KEY mancante — configura la variabile d\'ambiente sul server.', 400);
   }
 
   // ── FormData ──────────────────────────────────────────────────────────────
