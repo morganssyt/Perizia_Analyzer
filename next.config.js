@@ -22,7 +22,7 @@ if (fs.existsSync(workerSrc)) {
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   experimental: {
-    serverComponentsExternalPackages: ['pdf-parse', 'pdfjs-dist', '@napi-rs/canvas'],
+    serverComponentsExternalPackages: ['pdf-parse', 'pdfjs-dist', '@napi-rs/canvas', 'openai'],
   },
   webpack: (config, { isServer }) => {
     if (isServer) {

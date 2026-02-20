@@ -11,9 +11,10 @@
  * No rendering, no OCR, no image conversion, no multi-call batching.
  */
 
-// Allow up to 2 minutes on Vercel/edge runtimes
+// Allow up to 2 minutes on Vercel Pro
 export const maxDuration = 120;
 export const dynamic     = 'force-dynamic';
+export const runtime     = 'nodejs';
 
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI, { toFile } from 'openai';
